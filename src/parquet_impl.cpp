@@ -3,6 +3,9 @@
  */
 // basename comes from string.h on Linux,
 // but from libgen.h on other POSIX systems (see man basename)
+#include <arrow/result.h>
+#include <memory>
+#include <unistd.h>
 #ifndef GNU_SOURCE
 #include <libgen.h>
 #endif
@@ -11,6 +14,10 @@
 #include <math.h>
 #include <list>
 #include <set>
+
+#include <glob.h>
+
+#include "arrow/io/api.h"
 
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
@@ -32,7 +39,17 @@ extern "C"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+
+
+#if PG_VERSION_NUM < 170000
+// PG <= 17
 #include "commands/explain.h"
+#else
+// PG >= 18
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#endif
+
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
@@ -90,7 +107,7 @@ bool enable_multifile_merge;
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static void destroy_parquet_state(void *arg);
-
+static List * lappend_globbed_filenames(List *filenames, const char *filename);
 
 /*
  * Restriction
@@ -369,13 +386,13 @@ row_group_matches_filter(parquet::Statistics *stats,
 
         /* Do conversion */
         filter->value = convert_const(filter->value,
-                                      to_postgres_type(arrow_type->id()));
+                                      to_postgres_type(arrow_type));
     }
     val = filter->value->constvalue;
 
     find_cmp_func(&finfo,
                   filter->value->consttype,
-                  to_postgres_type(arrow_type->id()));
+                  to_postgres_type(arrow_type));
 
     switch (filter->strategy)
     {
@@ -496,7 +513,7 @@ parse_filenames_list(const char *str)
                 {
                     case ' ':
                         *cur = '\0';
-                        filenames = lappend(filenames, makeString(f));
+                        filenames = lappend_globbed_filenames(filenames, f);
                         state = PS_START;
                         break;
                     default:
@@ -508,7 +525,7 @@ parse_filenames_list(const char *str)
                 {
                     case '"':
                         *cur = '\0';
-                        filenames = lappend(filenames, makeString(f));
+                        filenames = lappend_globbed_filenames(filenames, f);
                         state = PS_START;
                         break;
                     default:
@@ -520,7 +537,58 @@ parse_filenames_list(const char *str)
         }
         cur++;
     }
-    filenames = lappend(filenames, makeString(f));
+    filenames = lappend_globbed_filenames(filenames, f);
+
+    return filenames;
+}
+
+/*
+ * lappend_globbed_filenames
+ *      The filename can be a globbing pathname matching potentially multiple files.
+ *      All the matched file names are added to the list.
+ */
+static List *
+lappend_globbed_filenames(List *filenames,
+                          const char *filename)
+{
+    glob_t  globbuf;
+
+    globbuf.gl_offs = 0;
+    int error = glob(filename, GLOB_ERR | GLOB_NOCHECK | GLOB_BRACE, NULL, &globbuf);
+    switch (error) {
+        case 0:
+            for (size_t i = globbuf.gl_offs; i < globbuf.gl_pathc; i++)
+            {
+                elog(DEBUG1, "parquet_fdw: adding globbed filename %s to list of files", globbuf.gl_pathv[i]);
+                filenames = lappend(filenames, makeString(pstrdup(globbuf.gl_pathv[i])));
+            }
+            break;
+        case GLOB_NOSPACE:
+            ereport(ERROR,
+                    (errcode(ERRCODE_OUT_OF_MEMORY),
+                    errmsg("parquet_fdw: running out of memory while globbing Parquet filename \"%s\"",
+                           filename)));
+            break;
+        case GLOB_ABORTED:
+            ereport(ERROR,
+                    (errcode(ERRCODE_IO_ERROR),
+                    errmsg("parquet_fdw: read error while globbing Parquet filename \"%s\". Check file permissions.",
+                           filename)));
+            break;
+        // Should not come here as we use GLOB_NOCHECK flag
+        case GLOB_NOMATCH:
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_FILE),
+                    errmsg("parquet_fdw: no Parquet filename matches \"%s\". Check path.",
+                           filename)));
+            break;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_SYSTEM_ERROR),
+                    errmsg("parquet_fdw: unknown error; no Parquet filename matches \"%s\". Check path and permissions.",
+                           filename)));
+    }
+    globfree(&globbuf);
 
     return filenames;
 }
@@ -538,7 +606,7 @@ extract_rowgroups_list(const char *filename,
                        uint64 *matched_rows,
                        uint64 *total_rows) noexcept
 {
-    std::unique_ptr<parquet::arrow::FileReader> reader;
+    std::shared_ptr<parquet::arrow::FileReader> reader;
     arrow::Status   status;
     List           *rowgroups = NIL;
     std::string     error;
@@ -546,23 +614,32 @@ extract_rowgroups_list(const char *filename,
     /* Open parquet file to read meta information */
     try
     {
-        status = parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(filename, false),
-                &reader);
 
-        if (!status.ok())
-            throw Error("failed to open Parquet file: %s ('%s')",
-                        status.message().c_str(), filename);
+        std::shared_ptr<arrow::io::RandomAccessFile> input;
+        arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result;
+        result = arrow::io::ReadableFile::Open(filename);
+
+        if (result.ok())
+            input = result.ValueOrDie();
+        else
+            throw Error("Error while opening file");
+
+        // Open Parquet file reader
+//
+        arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+        arrow::Result<std::shared_ptr<parquet::arrow::FileReader>> readResult;
+
+        readResult = parquet::arrow::OpenFile(input, pool);
+
+        if (readResult.ok())
+            reader = readResult.ValueOrDie();
+        else
+            throw Error("Error while reading file");
 
         auto meta = reader->parquet_reader()->metadata();
-        parquet::ArrowReaderProperties  props;
-        parquet::arrow::SchemaManifest  manifest;
 
-        status = parquet::arrow::SchemaManifest::Make(meta->schema(), nullptr,
-                                                      props, &manifest);
-        if (!status.ok())
-            throw Error("error creating arrow schema ('%s')", filename);
+        auto schema_manifest = reader->manifest();
 
         /* Check each row group whether it matches the filters */
         for (int r = 0; r < reader->num_row_groups(); r++)
@@ -586,7 +663,7 @@ extract_rowgroups_list(const char *filename,
                 /*
                  * Search for the column with the same name as filtered attribute
                  */
-                for (auto &schema_field : manifest.schema_fields)
+                for (auto &schema_field : schema_manifest.schema_fields)
                 {
                     MemoryContext   ccxt = CurrentMemoryContext;
                     bool            error = false;
@@ -707,23 +784,36 @@ extract_parquet_fields(const char *path) noexcept
 
     try
     {
-        std::unique_ptr<parquet::arrow::FileReader> reader;
+
+        std::shared_ptr<parquet::arrow::FileReader> reader;
         parquet::ArrowReaderProperties props;
         parquet::arrow::SchemaManifest manifest;
         arrow::Status   status;
         FieldInfo      *fields;
 
-        status = parquet::arrow::FileReader::Make(
-                    arrow::default_memory_pool(),
-                    parquet::ParquetFileReader::OpenFile(path, false),
-                    &reader);
-        if (!status.ok())
-            throw Error("failed to open Parquet file %s ('%s')",
-                        status.message().c_str(), path);
+        std::shared_ptr<arrow::io::RandomAccessFile> input;
+        arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result;
+        result = arrow::io::ReadableFile::Open(path);
 
-        auto p_schema = reader->parquet_reader()->metadata()->schema();
-        if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
-            throw Error("error creating arrow schema ('%s')", path);
+        if (result.ok())
+            input = result.ValueOrDie();
+        else
+            throw Error("Error while opening file");
+
+        // Open Parquet file reader
+//
+        arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+        arrow::Result<std::shared_ptr<parquet::arrow::FileReader>> readResult;
+
+        readResult = parquet::arrow::OpenFile(input, pool);
+
+        if (readResult.ok())
+            reader = readResult.ValueOrDie();
+        else
+            throw Error("Error while reading file");
+
+        manifest = reader->manifest();
 
         fields = (FieldInfo *) exc_palloc(
                 sizeof(FieldInfo) * manifest.schema_fields.size());
@@ -738,7 +828,7 @@ extract_parquet_fields(const char *path) noexcept
             {
                 case arrow::Type::LIST:
                 {
-                    arrow::Type::type subtype_id;
+                    arrow::DataType* subtype_id;
                     Oid     pg_subtype;
                     bool    error = false;
 
@@ -768,7 +858,7 @@ extract_parquet_fields(const char *path) noexcept
                     pg_type = JSONBOID;
                     break;
                 default:
-                    pg_type = to_postgres_type(type->id());
+                    pg_type = to_postgres_type(type.get());
             }
 
             if (pg_type != InvalidOid)
@@ -1320,11 +1410,13 @@ parquetGetForeignPaths(PlannerInfo *root,
     foreign_path = (Path *) create_foreignscan_path(root, baserel,
                                                     NULL,	/* default pathtarget */
                                                     baserel->rows,
+                                                    0,
                                                     startup_cost,
                                                     total_cost,
                                                     NULL,   /* no pathkeys */
                                                     NULL,	/* no outer rel either */
-                                                    NULL,	/* no extra plan */
+NULL,	/* no extra plan */
+                                                    (List*) baserel->baserestrictinfo,   /* No restrict info */
                                                     (List *) fdw_private);
     if (!enable_multifile && is_multi)
         foreign_path->total_cost += disable_cost;
@@ -1346,11 +1438,13 @@ parquetGetForeignPaths(PlannerInfo *root,
         path = (Path *) create_foreignscan_path(root, baserel,
                                                 NULL,	/* default pathtarget */
                                                 baserel->rows,
+                                                0,
                                                 startup_cost,
                                                 total_cost,
                                                 pathkeys,
                                                 NULL,	/* no outer rel either */
                                                 NULL,	/* no extra plan */
+                                                baserel->baserestrictinfo,
                                                 (List *) private_sort);
 
         /* For multifile case calculate the cost of merging files */
@@ -1387,11 +1481,13 @@ parquetGetForeignPaths(PlannerInfo *root,
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
                                          rows_per_worker,
+                                         0,
                                          startup_cost,
                                          startup_cost + run_cost / (num_workers + 1),
                                          use_pathkeys ? pathkeys : NULL,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
+                                         baserel->baserestrictinfo,
                                          (List *) private_parallel);
 
         path->parallel_workers = num_workers;
@@ -1417,10 +1513,12 @@ parquetGetForeignPaths(PlannerInfo *root,
             path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
+                                             baserel->rows,
                                              rows_per_worker,
                                              startup_cost,
                                              total_cost,
                                              pathkeys,
+                                             NULL,
                                              NULL,	/* no outer rel either */
                                              NULL,	/* no extra plan */
                                              (List *) private_parallel_merge);
@@ -1451,6 +1549,8 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
                       Plan *outer_plan)
 {
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
+    if (fdw_private == NULL)
+        fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
     Index		scan_relid = baserel->relid;
     List       *attrs_used = NIL;
     List       *attrs_sorted = NIL;
@@ -1474,8 +1574,9 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
      * Nodes. So we need to convert everything in nodes and store it in a List.
      */
     attr = -1;
-    while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
-        attrs_used = lappend_int(attrs_used, attr);
+    if (fdw_private->attrs_used)
+        while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
+            attrs_used = lappend_int(attrs_used, attr);
 
     foreach (lc, fdw_private->attrs_sorted)
         attrs_sorted = lappend_int(attrs_sorted, lfirst_int(lc));
@@ -1733,17 +1834,30 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
 
         try
         {
-            std::unique_ptr<parquet::arrow::FileReader> reader;
-            arrow::Status   status;
             List           *rowgroups = NIL;
+            std::shared_ptr<parquet::arrow::FileReader> reader;
+            std::shared_ptr<arrow::io::RandomAccessFile> input;
+            arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result;
+            result = arrow::io::ReadableFile::Open(filename);
 
-            status = parquet::arrow::FileReader::Make(
-                        arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename, false),
-                        &reader);
-            if (!status.ok())
-                throw Error("failed to open Parquet file: %s",
-                                     status.message().c_str());
+            if (result.ok())
+                input = result.ValueOrDie();
+            else
+                throw Error("Error while opening file");
+
+            // Open Parquet file reader
+    //
+            arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+            arrow::Result<std::shared_ptr<parquet::arrow::FileReader>> readResult;
+
+            readResult = parquet::arrow::OpenFile(input, pool);
+
+            if (readResult.ok())
+                reader = readResult.ValueOrDie();
+            else
+                throw Error("Error while reading file");
+
             auto meta = reader->parquet_reader()->metadata();
             num_rows += meta->num_rows();
 

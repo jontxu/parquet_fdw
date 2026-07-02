@@ -5,7 +5,8 @@
 #include <set>
 #include <vector>
 
-#include "arrow/api.h"
+#include "arrow/io/api.h"
+#include "arrow/type.h"
 #include "parquet/arrow/reader.h"
 
 extern "C"
@@ -122,6 +123,7 @@ protected:
     {
         struct
         {
+            std::shared_ptr<arrow::DataType> type;
             arrow::Type::type   type_id;
             std::string         type_name;
         } arrow;
@@ -167,6 +169,7 @@ protected:
         TypeInfo(std::shared_ptr<arrow::DataType> arrow_type, Oid typid=InvalidOid)
             : TypeInfo()
         {
+            arrow.type = arrow_type;
             arrow.type_id = arrow_type->id();
             arrow.type_name = arrow_type->name();
             pg.oid = typid;
@@ -182,7 +185,7 @@ protected:
     /* The reader identifier needed for parallel execution */
     int32_t                         reader_id;
 
-    std::unique_ptr<parquet::arrow::FileReader> reader;
+    std::shared_ptr<parquet::arrow::FileReader> reader;
 
     /* Arrow column indices that are used in query */
     std::vector<int>                indices;

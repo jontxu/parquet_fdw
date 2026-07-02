@@ -24,8 +24,7 @@ PG_CONFIG ?= pg_config
 
 ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-# parquet_impl.cpp requires C++ 11 and libarrow 10+ requires C++ 17
-override PG_CXXFLAGS += -std=c++17 -O3
+override PG_CXXFLAGS += -std=c++20 -O3
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 

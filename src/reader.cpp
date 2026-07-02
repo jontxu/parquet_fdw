@@ -1,9 +1,14 @@
+#include <arrow/io/interfaces.h>
 #include <list>
+#include <memory>
 
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
+#include "parquet/arrow/reader.h"
 #include "parquet/file_reader.h"
 #include "parquet/statistics.h"
+
+#include "arrow/api.h"
 
 #include "common.hpp"
 #include "reader.hpp"
@@ -269,8 +274,8 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         Assert(strct.children.size() == 2);
                         auto &key = strct.children[0];
                         auto &item = strct.children[1];
-                        Oid pg_key_type = to_postgres_type(key.field->type()->id());
-                        Oid pg_item_type = to_postgres_type(item.field->type()->id());
+                        Oid pg_key_type = to_postgres_type(key.field->type().get());
+                        Oid pg_item_type = to_postgres_type(item.field->type().get());
 
                         typinfo.children.emplace_back(key.field->type(),
                                                       pg_key_type);
@@ -620,7 +625,7 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
 void ParquetReader::initialize_cast(TypeInfo &typinfo, const char *attname)
 {
     MemoryContext ccxt = CurrentMemoryContext;
-    Oid         src_oid = to_postgres_type(typinfo.arrow.type_id);
+    Oid         src_oid = to_postgres_type(typinfo.arrow.type.get());
     Oid         dst_oid = typinfo.pg.oid;
     bool        error = false;
     char        errstr[ERROR_STR_LEN];
@@ -829,16 +834,29 @@ public:
 
     void open()
     {
-        arrow::Status   status;
-        std::unique_ptr<parquet::arrow::FileReader> reader;
+        std::shared_ptr<parquet::arrow::FileReader> reader;
+        std::shared_ptr<arrow::io::RandomAccessFile> input;
+        arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result;
+        result = arrow::io::ReadableFile::Open(filename);
 
-        status = parquet::arrow::FileReader::Make(
-                        arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                        &reader);
-        if (!status.ok())
-            throw Error("failed to open Parquet file %s ('%s')",
-                        status.message().c_str(), filename.c_str());
+        if (result.ok())
+            input = result.ValueOrDie();
+        else
+            throw Error("Error while opening file");
+
+        // Open Parquet file reader
+//
+        arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+        arrow::Result<std::shared_ptr<parquet::arrow::FileReader>> readResult;
+
+        readResult = parquet::arrow::OpenFile(input, pool);
+
+        if (readResult.ok())
+            reader = readResult.ValueOrDie();
+        else
+            throw Error("Error while reading file");
+
         this->reader = std::move(reader);
 
         /* Enable parallel columns decoding/decompression if needed */
@@ -1069,17 +1087,29 @@ public:
 
     void open()
     {
-        arrow::Status   status;
-        std::unique_ptr<parquet::arrow::FileReader> reader;
 
-        status = parquet::arrow::FileReader::Make(
-                        arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                        &reader);
-        if (!status.ok())
-            throw Error("failed to open Parquet file %s ('%s')",
-                        status.message().c_str(), filename.c_str());
-        this->reader = std::move(reader);
+        std::shared_ptr<parquet::arrow::FileReader> reader;
+        std::shared_ptr<arrow::io::RandomAccessFile> input;
+        arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> result;
+        result = arrow::io::ReadableFile::Open(filename);
+
+        if (result.ok())
+            input = result.ValueOrDie();
+        else
+            throw Error("Error while opening file");
+
+        // Open Parquet file reader
+//
+        arrow::MemoryPool* pool = arrow::default_memory_pool();
+
+        arrow::Result<std::shared_ptr<parquet::arrow::FileReader>> readResult;
+
+        readResult = parquet::arrow::OpenFile(input, pool);
+
+        if (readResult.ok())
+            reader = readResult.ValueOrDie();
+        else
+            throw Error("Error while reading file");
 
         /* Enable parallel columns decoding/decompression if needed */
         this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);

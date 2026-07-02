@@ -1,7 +1,14 @@
 #include "postgres.h"
 #include "fmgr.h"
 
+#if PG_VERSION_NUM < 170000
+// PG <= 17
 #include "commands/explain.h"
+#else
+// PG >= 18
+#include "commands/explain_state.h"
+
+#endif
 #include "foreign/fdwapi.h"
 #include "utils/guc.h"
 
