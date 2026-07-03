@@ -41,7 +41,7 @@ extern "C"
 #include "commands/defrem.h"
 
 
-#if PG_VERSION_NUM < 170000
+#if PG_VERSION_NUM < 180000
 // PG <= 17
 #include "commands/explain.h"
 #else
@@ -1407,7 +1407,19 @@ parquetGetForeignPaths(PlannerInfo *root,
         }
     }
 
-    foreign_path = (Path *) create_foreignscan_path(root, baserel,
+    #if PG_VERSION_NUM < 180000
+        foreign_path = (Path *) create_foreignscan_path(root, baserel,
+                                                    NULL,	/* default pathtarget */
+                                                    baserel->rows,
+                                                    startup_cost,
+                                                    total_cost,
+                                                    NULL,   /* no pathkeys */
+                                                    NULL,	/* no outer rel either */
+NULL,	/* no extra plan */
+                                                    (List*) baserel->baserestrictinfo,   /* No restrict info */
+                                                    (List *) fdw_private);
+    #else
+        foreign_path = (Path *) create_foreignscan_path(root, baserel,
                                                     NULL,	/* default pathtarget */
                                                     baserel->rows,
                                                     0,
@@ -1418,6 +1430,8 @@ parquetGetForeignPaths(PlannerInfo *root,
 NULL,	/* no extra plan */
                                                     (List*) baserel->baserestrictinfo,   /* No restrict info */
                                                     (List *) fdw_private);
+    #endif
+
     if (!enable_multifile && is_multi)
         foreign_path->total_cost += disable_cost;
 
@@ -1435,6 +1449,18 @@ NULL,	/* no extra plan */
         private_sort = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
         memcpy(private_sort, fdw_private, sizeof(ParquetFdwPlanState));
 
+        #if PG_VERSION_NUM < 180000
+        path = (Path *) create_foreignscan_path(root, baserel,
+                                                NULL,	/* default pathtarget */
+                                                baserel->rows,
+                                                startup_cost,
+                                                total_cost,
+                                                pathkeys,
+                                                NULL,	/* no outer rel either */
+                                                NULL,	/* no extra plan */
+                                                baserel->baserestrictinfo,
+                                                (List *) private_sort);
+        #else
         path = (Path *) create_foreignscan_path(root, baserel,
                                                 NULL,	/* default pathtarget */
                                                 baserel->rows,
@@ -1446,7 +1472,7 @@ NULL,	/* no extra plan */
                                                 NULL,	/* no extra plan */
                                                 baserel->baserestrictinfo,
                                                 (List *) private_sort);
-
+        #endif
         /* For multifile case calculate the cost of merging files */
         if (is_multi)
         {
@@ -1477,6 +1503,21 @@ NULL,	/* no extra plan */
         /* For mutifile reader only use pathkeys when files are in order */
         use_pathkeys = is_sorted && (!is_multi || (is_multi && fdw_private->files_in_order));
 
+        #if PG_VERSION_NUM < 180000
+
+        Path *path = (Path *)
+                 create_foreignscan_path(root, baserel,
+                                         NULL,	/* default pathtarget */
+                                         rows_per_worker,
+                                         startup_cost,
+                                         startup_cost + run_cost / (num_workers + 1),
+                                         use_pathkeys ? pathkeys : NULL,
+                                         NULL,	/* no outer rel either */
+                                         NULL,	/* no extra plan */
+                                         baserel->baserestrictinfo,
+                                         (List *) private_parallel);
+        #else
+
         Path *path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
@@ -1489,6 +1530,7 @@ NULL,	/* no extra plan */
                                          NULL,	/* no extra plan */
                                          baserel->baserestrictinfo,
                                          (List *) private_parallel);
+        #endif
 
         path->parallel_workers = num_workers;
         path->parallel_aware   = true;
@@ -1510,6 +1552,19 @@ NULL,	/* no extra plan */
             private_parallel_merge->type = private_parallel_merge->max_open_files > 0 ?
                 RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
+        #if PG_VERSION_NUM < 180000
+            path = (Path *)
+                     create_foreignscan_path(root, baserel,
+                                             NULL,	/* default pathtarget */
+                                             rows_per_worker,
+                                             startup_cost,
+                                             total_cost,
+                                             pathkeys,
+                                             NULL,
+                                             NULL,	/* no outer rel either */
+                                             NULL,	/* no extra plan */
+                                             (List *) private_parallel_merge);
+        #else
             path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
@@ -1522,6 +1577,8 @@ NULL,	/* no extra plan */
                                              NULL,	/* no outer rel either */
                                              NULL,	/* no extra plan */
                                              (List *) private_parallel_merge);
+        #endif
+
 
             cost_merge(path, list_length(private_parallel_merge->filenames),
                        startup_cost, total_cost, path->rows);

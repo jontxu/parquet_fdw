@@ -1,7 +1,7 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#if PG_VERSION_NUM < 170000
+#if PG_VERSION_NUM < 180000
 // PG <= 17
 #include "commands/explain.h"
 #else
